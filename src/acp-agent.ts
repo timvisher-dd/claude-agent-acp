@@ -105,12 +105,23 @@ export interface Logger {
   error: (...args: any[]) => void;
 }
 
+type PromptResolve = {
+  resolve: (response: PromptResponse) => void;
+  reject: (error: Error) => void;
+};
+
 type Session = {
   query: Query;
   input: Pushable<SDKUserMessage>;
   cancelled: boolean;
   permissionMode: PermissionMode;
   settingsManager: SettingsManager;
+  /** Promise that resolves when the drain loop sees the first `result` after a prompt. */
+  pendingPrompt: PromptResolve | null;
+  /** Background task IDs that are currently running. */
+  activeTasks: Set<string>;
+  /** The drain loop promise — runs for the session lifetime. */
+  drainPromise: Promise<void>;
 };
 
 type SessionHistoryEntry = {
@@ -545,191 +556,256 @@ export class ClaudeAcpAgent implements Agent {
   }
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {
-    if (!this.sessions[params.sessionId]) {
+    const session = this.sessions[params.sessionId];
+    if (!session) {
       throw new Error("Session not found");
     }
 
-    this.sessions[params.sessionId].cancelled = false;
+    // Reject any previously pending prompt that was never resolved
+    if (session.pendingPrompt) {
+      const stale = session.pendingPrompt;
+      session.pendingPrompt = null;
+      stale.reject(new Error("Prompt superseded by a new prompt"));
+    }
 
-    const { query, input } = this.sessions[params.sessionId];
+    session.cancelled = false;
 
-    input.push(promptToClaude(params));
-    while (true) {
-      const { value: message, done } = await query.next();
-      if (done || !message) {
-        if (this.sessions[params.sessionId].cancelled) {
-          return { stopReason: "cancelled" };
+    session.input.push(promptToClaude(params));
+
+    return new Promise<PromptResponse>((resolve, reject) => {
+      session.pendingPrompt = { resolve, reject };
+    });
+  }
+
+  /**
+   * Persistent drain loop that runs for the session lifetime.
+   * Dispatches every SDK message. Resolves the pending prompt promise
+   * when it sees the first `result` after a prompt's user message.
+   * Between-turn events are forwarded as session/update notifications.
+   */
+  private async drainSession(sessionId: string): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session) return;
+
+    try {
+      for await (const message of session.query) {
+        if (!this.sessions[sessionId]) break;
+
+        switch (message.type) {
+          case "system":
+            switch (message.subtype) {
+              case "init":
+                break;
+              case "task_notification":
+                session.activeTasks.delete(message.task_id);
+                break;
+              case "compact_boundary":
+              case "hook_started":
+              case "hook_progress":
+              case "hook_response":
+              case "status":
+              case "files_persisted":
+                break;
+              default:
+                unreachable(message, this.logger);
+                break;
+            }
+            break;
+          case "result": {
+            const pending = session.pendingPrompt;
+            if (pending) {
+              session.pendingPrompt = null;
+
+              if (session.cancelled) {
+                pending.resolve({ stopReason: "cancelled" });
+                break;
+              }
+
+              switch (message.subtype) {
+                case "success": {
+                  if (message.result.includes("Please run /login")) {
+                    pending.reject(RequestError.authRequired());
+                    break;
+                  }
+                  if (message.is_error) {
+                    pending.reject(RequestError.internalError(undefined, message.result));
+                    break;
+                  }
+                  pending.resolve({ stopReason: "end_turn" });
+                  break;
+                }
+                case "error_during_execution":
+                  if (message.is_error) {
+                    pending.reject(
+                      RequestError.internalError(
+                        undefined,
+                        message.errors.join(", ") || message.subtype,
+                      ),
+                    );
+                    break;
+                  }
+                  pending.resolve({ stopReason: "end_turn" });
+                  break;
+                case "error_max_budget_usd":
+                case "error_max_turns":
+                case "error_max_structured_output_retries":
+                  if (message.is_error) {
+                    pending.reject(
+                      RequestError.internalError(
+                        undefined,
+                        message.errors.join(", ") || message.subtype,
+                      ),
+                    );
+                    break;
+                  }
+                  pending.resolve({ stopReason: "max_turn_requests" });
+                  break;
+                default:
+                  unreachable(message, this.logger);
+                  break;
+              }
+            }
+            // Between-turn results (e.g. from auto-turns after background tasks)
+            // are consumed but not resolved to a prompt — the drain loop just continues.
+            break;
+          }
+          case "stream_event": {
+            for (const notification of streamEventToAcpNotifications(
+              message,
+              sessionId,
+              this.toolUseCache,
+              this.client,
+              this.logger,
+            )) {
+              await this.client.sessionUpdate(notification);
+            }
+            break;
+          }
+          case "user":
+          case "assistant": {
+            if (session.cancelled) {
+              break;
+            }
+
+            // Slash commands like /compact can generate invalid output... doesn't match
+            // their own docs: https://docs.anthropic.com/en/docs/claude-code/sdk/sdk-slash-commands#%2Fcompact-compact-conversation-history
+            if (
+              typeof message.message.content === "string" &&
+              message.message.content.includes("<local-command-stdout>")
+            ) {
+              // Handle /context by sending its reply as regular agent message.
+              if (message.message.content.includes("Context Usage")) {
+                for (const notification of toAcpNotifications(
+                  message.message.content
+                    .replace("<local-command-stdout>", "")
+                    .replace("</local-command-stdout>", ""),
+                  "assistant",
+                  sessionId,
+                  this.toolUseCache,
+                  this.client,
+                  this.logger,
+                )) {
+                  await this.client.sessionUpdate(notification);
+                }
+              }
+              this.logger.log(message.message.content);
+              break;
+            }
+
+            if (
+              typeof message.message.content === "string" &&
+              message.message.content.includes("<local-command-stderr>")
+            ) {
+              this.logger.error(message.message.content);
+              break;
+            }
+            // Skip these user messages for now, since they seem to just be messages we don't want in the feed
+            if (
+              message.type === "user" &&
+              (typeof message.message.content === "string" ||
+                (Array.isArray(message.message.content) &&
+                  message.message.content.length === 1 &&
+                  message.message.content[0].type === "text"))
+            ) {
+              break;
+            }
+
+            if (
+              message.type === "assistant" &&
+              message.message.model === "<synthetic>" &&
+              Array.isArray(message.message.content) &&
+              message.message.content.length === 1 &&
+              message.message.content[0].type === "text" &&
+              message.message.content[0].text.includes("Please run /login")
+            ) {
+              if (session.pendingPrompt) {
+                const pending = session.pendingPrompt;
+                session.pendingPrompt = null;
+                pending.reject(RequestError.authRequired());
+              }
+              break;
+            }
+
+            const content =
+              message.type === "assistant"
+                ? // Handled by stream events above
+                  message.message.content.filter(
+                    (item) => !["text", "thinking"].includes(item.type),
+                  )
+                : message.message.content;
+
+            for (const notification of toAcpNotifications(
+              content,
+              message.message.role,
+              sessionId,
+              this.toolUseCache,
+              this.client,
+              this.logger,
+            )) {
+              await this.client.sessionUpdate(notification);
+            }
+            break;
+          }
+          case "tool_progress":
+          case "tool_use_summary":
+            break;
+          case "auth_status":
+            break;
+          default:
+            unreachable(message);
+            break;
         }
-        break;
       }
 
-      switch (message.type) {
-        case "system":
-          switch (message.subtype) {
-            case "init":
-              break;
-            case "compact_boundary":
-            case "hook_started":
-            case "task_notification":
-            case "hook_progress":
-            case "hook_response":
-            case "status":
-            case "files_persisted":
-              // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
-              break;
-            default:
-              unreachable(message, this.logger);
-              break;
-          }
-          break;
-        case "result": {
-          if (this.sessions[params.sessionId].cancelled) {
-            return { stopReason: "cancelled" };
-          }
-
-          switch (message.subtype) {
-            case "success": {
-              if (message.result.includes("Please run /login")) {
-                throw RequestError.authRequired();
-              }
-              if (message.is_error) {
-                throw RequestError.internalError(undefined, message.result);
-              }
-              return { stopReason: "end_turn" };
-            }
-            case "error_during_execution":
-              if (message.is_error) {
-                throw RequestError.internalError(
-                  undefined,
-                  message.errors.join(", ") || message.subtype,
-                );
-              }
-              return { stopReason: "end_turn" };
-            case "error_max_budget_usd":
-            case "error_max_turns":
-            case "error_max_structured_output_retries":
-              if (message.is_error) {
-                throw RequestError.internalError(
-                  undefined,
-                  message.errors.join(", ") || message.subtype,
-                );
-              }
-              return { stopReason: "max_turn_requests" };
-            default:
-              unreachable(message, this.logger);
-              break;
-          }
-          break;
+      // Generator exhausted — if there's still a pending prompt, reject it
+      const pending = session.pendingPrompt;
+      if (pending) {
+        session.pendingPrompt = null;
+        if (session.cancelled) {
+          pending.resolve({ stopReason: "cancelled" });
+        } else {
+          pending.reject(new Error("Session did not end in result"));
         }
-        case "stream_event": {
-          for (const notification of streamEventToAcpNotifications(
-            message,
-            params.sessionId,
-            this.toolUseCache,
-            this.client,
-            this.logger,
-          )) {
-            await this.client.sessionUpdate(notification);
-          }
-          break;
-        }
-        case "user":
-        case "assistant": {
-          if (this.sessions[params.sessionId].cancelled) {
-            break;
-          }
-
-          // Slash commands like /compact can generate invalid output... doesn't match
-          // their own docs: https://docs.anthropic.com/en/docs/claude-code/sdk/sdk-slash-commands#%2Fcompact-compact-conversation-history
-          if (
-            typeof message.message.content === "string" &&
-            message.message.content.includes("<local-command-stdout>")
-          ) {
-            // Handle /context by sending its reply as regular agent message.
-            if (message.message.content.includes("Context Usage")) {
-              for (const notification of toAcpNotifications(
-                message.message.content
-                  .replace("<local-command-stdout>", "")
-                  .replace("</local-command-stdout>", ""),
-                "assistant",
-                params.sessionId,
-                this.toolUseCache,
-                this.client,
-                this.logger,
-              )) {
-                await this.client.sessionUpdate(notification);
-              }
-            }
-            this.logger.log(message.message.content);
-            break;
-          }
-
-          if (
-            typeof message.message.content === "string" &&
-            message.message.content.includes("<local-command-stderr>")
-          ) {
-            this.logger.error(message.message.content);
-            break;
-          }
-          // Skip these user messages for now, since they seem to just be messages we don't want in the feed
-          if (
-            message.type === "user" &&
-            (typeof message.message.content === "string" ||
-              (Array.isArray(message.message.content) &&
-                message.message.content.length === 1 &&
-                message.message.content[0].type === "text"))
-          ) {
-            break;
-          }
-
-          if (
-            message.type === "assistant" &&
-            message.message.model === "<synthetic>" &&
-            Array.isArray(message.message.content) &&
-            message.message.content.length === 1 &&
-            message.message.content[0].type === "text" &&
-            message.message.content[0].text.includes("Please run /login")
-          ) {
-            throw RequestError.authRequired();
-          }
-
-          const content =
-            message.type === "assistant"
-              ? // Handled by stream events above
-                message.message.content.filter((item) => !["text", "thinking"].includes(item.type))
-              : message.message.content;
-
-          for (const notification of toAcpNotifications(
-            content,
-            message.message.role,
-            params.sessionId,
-            this.toolUseCache,
-            this.client,
-            this.logger,
-          )) {
-            await this.client.sessionUpdate(notification);
-          }
-          break;
-        }
-        case "tool_progress":
-        case "tool_use_summary":
-          break;
-        case "auth_status":
-          break;
-        default:
-          unreachable(message);
-          break;
+      }
+    } catch (error) {
+      // If the drain loop throws (e.g. sessionUpdate rejects), reject any pending prompt
+      const pending = session.pendingPrompt;
+      if (pending) {
+        session.pendingPrompt = null;
+        pending.reject(error instanceof Error ? error : new Error(String(error)));
+      } else {
+        this.logger.error("[drainSession] unhandled error:", error);
       }
     }
-    throw new Error("Session did not end in result");
   }
 
   async cancel(params: CancelNotification): Promise<void> {
-    if (!this.sessions[params.sessionId]) {
+    const session = this.sessions[params.sessionId];
+    if (!session) {
       throw new Error("Session not found");
     }
-    this.sessions[params.sessionId].cancelled = true;
-    await this.sessions[params.sessionId].query.interrupt();
+    session.cancelled = true;
+    await session.query.interrupt();
   }
 
   async unstable_setSessionModel(
@@ -1195,9 +1271,15 @@ export class ClaudeAcpAgent implements Agent {
       cancelled: false,
       permissionMode,
       settingsManager,
+      pendingPrompt: null,
+      activeTasks: new Set(),
+      drainPromise: Promise.resolve(),
     };
 
     const initializationResult = await q.initializationResult();
+
+    // Start the persistent drain loop after initialization
+    this.sessions[sessionId].drainPromise = this.drainSession(sessionId);
 
     const models = await getAvailableModels(q, initializationResult.models, settingsManager);
 

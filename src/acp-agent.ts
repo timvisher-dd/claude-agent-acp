@@ -36,8 +36,6 @@ import {
   SetSessionModeResponse,
   CloseSessionRequest,
   CloseSessionResponse,
-  TerminalHandle,
-  TerminalOutputResponse,
   WriteTextFileRequest,
   WriteTextFileResponse,
   StopReason,
@@ -126,6 +124,10 @@ type Session = {
   pendingMessages: Map<string, { resolve: (cancelled: boolean) => void; order: number }>;
   nextPendingOrder: number;
   abortController: AbortController;
+  activeTasks: Set<string>;
+  lastAssistantTotalUsage: number | null;
+  lastAssistantModel: string | null;
+  lastContextWindowSize: number;
 };
 
 /** Compute a stable fingerprint of the session-defining params so we can
@@ -139,17 +141,6 @@ function computeSessionFingerprint(params: {
   const servers = [...(params.mcpServers ?? [])].sort((a, b) => a.name.localeCompare(b.name));
   return JSON.stringify({ cwd: params.cwd, mcpServers: servers });
 }
-
-type BackgroundTerminal =
-  | {
-      handle: TerminalHandle;
-      status: "started";
-      lastOutput: TerminalOutputResponse | null;
-    }
-  | {
-      status: "aborted" | "exited" | "killed" | "timedOut";
-      pendingOutput: TerminalOutputResponse;
-    };
 
 /**
  * Extra metadata that can be given when creating a new session.
@@ -293,7 +284,6 @@ export class ClaudeAcpAgent implements Agent {
   };
   client: AgentSideConnection;
   toolUseCache: ToolUseCache;
-  backgroundTerminals: { [key: string]: BackgroundTerminal } = {};
   clientCapabilities?: ClientCapabilities;
   logger: Logger;
   gatewayAuthMeta?: GatewayAuthMeta;
@@ -531,10 +521,6 @@ export class ClaudeAcpAgent implements Agent {
       cachedWriteTokens: 0,
     };
 
-    let lastAssistantTotalUsage: number | null = null;
-    let lastAssistantModel: string | null = null;
-    let lastContextWindowSize: number = 200000;
-
     const userMessage = promptToClaude(params);
 
     const promptUuid = randomUUID();
@@ -561,8 +547,51 @@ export class ClaudeAcpAgent implements Agent {
     }
 
     session.promptRunning = true;
+
+    // Create deferred promise — resolved by processPromptLoop on first result
+    let resolveResult!: (response: PromptResponse) => void;
+    let rejectResult!: (error: unknown) => void;
+    const resultPromise = new Promise<PromptResponse>((resolve, reject) => {
+      resolveResult = resolve;
+      rejectResult = reject;
+    });
+
+    // Start processing loop (runs until idle, outlives the returned promise)
+    void this.processPromptLoop(
+      session,
+      params.sessionId,
+      promptUuid,
+      isLocalOnlyCommand,
+      resolveResult,
+      rejectResult,
+    );
+
+    return resultPromise;
+  }
+
+  private async processPromptLoop(
+    session: Session,
+    sessionId: string,
+    promptUuid: string,
+    isLocalOnlyCommand: boolean,
+    resolvePrompt: (response: PromptResponse) => void,
+    rejectPrompt: (error: unknown) => void,
+  ): Promise<void> {
     let handedOff = false;
     let stopReason: StopReason = "end_turn";
+    let promptResolved = false;
+    // Local-only commands return a result without replaying the user message,
+    // so treat them as already replayed. For normal prompts, wait for the
+    // UUID replay before resolving on result — pre-replay results come from
+    // background tasks that completed before the SDK started our turn.
+    let promptReplayed = isLocalOnlyCommand;
+
+    const resolveIfPending = (response: PromptResponse) => {
+      if (!promptResolved && promptReplayed) {
+        promptResolved = true;
+        resolvePrompt(response);
+      }
+    };
 
     try {
       while (true) {
@@ -570,7 +599,7 @@ export class ClaudeAcpAgent implements Agent {
 
         if (done || !message) {
           if (session.cancelled) {
-            return { stopReason: "cancelled" };
+            resolveIfPending({ stopReason: "cancelled" });
           }
           break;
         }
@@ -604,13 +633,13 @@ export class ClaudeAcpAgent implements Agent {
                 // The alternative (no update) leaves the client showing e.g.
                 // "944k/1m" right after the user sees "Compacting completed",
                 // which is confusing and wrong.
-                lastAssistantTotalUsage = 0;
+                session.lastAssistantTotalUsage = 0;
                 await this.client.sessionUpdate({
                   sessionId: message.session_id,
                   update: {
                     sessionUpdate: "usage_update",
                     used: 0,
-                    size: lastContextWindowSize,
+                    size: session.lastContextWindowSize,
                   },
                 });
                 await this.client.sessionUpdate({
@@ -634,20 +663,26 @@ export class ClaudeAcpAgent implements Agent {
               }
               case "session_state_changed": {
                 if (message.state === "idle") {
-                  return { stopReason, usage: sessionUsage(session) };
+                  resolveIfPending({ stopReason, usage: sessionUsage(session) });
+                  return;
                 }
+                break;
+              }
+              case "task_started": {
+                session.activeTasks.add(message.task_id);
+                break;
+              }
+              case "task_notification": {
+                session.activeTasks.delete(message.task_id);
                 break;
               }
               case "hook_started":
               case "hook_progress":
               case "hook_response":
               case "files_persisted":
-              case "task_started":
-              case "task_notification":
               case "task_progress":
               case "elicitation_complete":
               case "api_retry":
-                // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
                 break;
               default:
                 unreachable(message, this.logger);
@@ -661,19 +696,19 @@ export class ClaudeAcpAgent implements Agent {
             session.accumulatedUsage.cachedReadTokens += message.usage.cache_read_input_tokens;
             session.accumulatedUsage.cachedWriteTokens += message.usage.cache_creation_input_tokens;
 
-            const matchingModelUsage = lastAssistantModel
-              ? getMatchingModelUsage(message.modelUsage, lastAssistantModel)
+            const matchingModelUsage = session.lastAssistantModel
+              ? getMatchingModelUsage(message.modelUsage, session.lastAssistantModel)
               : null;
             const contextWindowSize = matchingModelUsage?.contextWindow ?? 200000;
-            lastContextWindowSize = contextWindowSize;
+            session.lastContextWindowSize = contextWindowSize;
 
             // Send usage_update notification
-            if (lastAssistantTotalUsage !== null) {
+            if (session.lastAssistantTotalUsage !== null) {
               await this.client.sessionUpdate({
-                sessionId: params.sessionId,
+                sessionId,
                 update: {
                   sessionUpdate: "usage_update",
-                  used: lastAssistantTotalUsage,
+                  used: session.lastAssistantTotalUsage,
                   size: contextWindowSize,
                   cost: {
                     amount: message.total_cost_usd,
@@ -685,72 +720,78 @@ export class ClaudeAcpAgent implements Agent {
 
             if (session.cancelled) {
               stopReason = "cancelled";
+              resolveIfPending({ stopReason, usage: sessionUsage(session) });
               break;
             }
 
-            switch (message.subtype) {
-              case "success": {
-                if (message.result.includes("Please run /login")) {
-                  throw RequestError.authRequired();
-                }
-                if (message.stop_reason === "max_tokens") {
-                  stopReason = "max_tokens";
-                  break;
-                }
-                if (message.is_error) {
-                  throw RequestError.internalError(undefined, message.result);
-                }
-                // For local-only commands (no model invocation), the result
-                // text is the command output — forward it to the client.
-                if (isLocalOnlyCommand) {
-                  for (const notification of toAcpNotifications(
-                    message.result,
-                    "assistant",
-                    params.sessionId,
-                    this.toolUseCache,
-                    this.client,
-                    this.logger,
-                  )) {
-                    await this.client.sessionUpdate(notification);
+            if (!promptResolved) {
+              switch (message.subtype) {
+                case "success": {
+                  if (message.result.includes("Please run /login")) {
+                    throw RequestError.authRequired();
                   }
-                }
-                break;
-              }
-              case "error_during_execution": {
-                if (message.stop_reason === "max_tokens") {
-                  stopReason = "max_tokens";
+                  if (message.stop_reason === "max_tokens") {
+                    stopReason = "max_tokens";
+                    break;
+                  }
+                  if (message.is_error) {
+                    throw RequestError.internalError(undefined, message.result);
+                  }
+                  // For local-only commands (no model invocation), the result
+                  // text is the command output — forward it to the client.
+                  if (isLocalOnlyCommand) {
+                    for (const notification of toAcpNotifications(
+                      message.result,
+                      "assistant",
+                      sessionId,
+                      this.toolUseCache,
+                      this.client,
+                      this.logger,
+                    )) {
+                      await this.client.sessionUpdate(notification);
+                    }
+                  }
                   break;
                 }
-                if (message.is_error) {
-                  throw RequestError.internalError(
-                    undefined,
-                    message.errors.join(", ") || message.subtype,
-                  );
+                case "error_during_execution": {
+                  if (message.stop_reason === "max_tokens") {
+                    stopReason = "max_tokens";
+                    break;
+                  }
+                  if (message.is_error) {
+                    throw RequestError.internalError(
+                      undefined,
+                      message.errors.join(", ") || message.subtype,
+                    );
+                  }
+                  stopReason = "end_turn";
+                  break;
                 }
-                stopReason = "end_turn";
-                break;
+                case "error_max_budget_usd":
+                case "error_max_turns":
+                case "error_max_structured_output_retries":
+                  if (message.is_error) {
+                    throw RequestError.internalError(
+                      undefined,
+                      message.errors.join(", ") || message.subtype,
+                    );
+                  }
+                  stopReason = "max_turn_requests";
+                  break;
+                default:
+                  unreachable(message, this.logger);
+                  break;
               }
-              case "error_max_budget_usd":
-              case "error_max_turns":
-              case "error_max_structured_output_retries":
-                if (message.is_error) {
-                  throw RequestError.internalError(
-                    undefined,
-                    message.errors.join(", ") || message.subtype,
-                  );
-                }
-                stopReason = "max_turn_requests";
-                break;
-              default:
-                unreachable(message, this.logger);
-                break;
+
+              // Resolve the prompt on first result
+              resolveIfPending({ stopReason, usage: sessionUsage(session) });
             }
             break;
           }
           case "stream_event": {
             for (const notification of streamEventToAcpNotifications(
               message,
-              params.sessionId,
+              sessionId,
               this.toolUseCache,
               this.client,
               this.logger,
@@ -772,6 +813,7 @@ export class ClaudeAcpAgent implements Agent {
             // Check for prompt replay
             if (message.type === "user" && "uuid" in message && message.uuid) {
               if (message.uuid === promptUuid) {
+                promptReplayed = true;
                 break;
               }
 
@@ -780,9 +822,8 @@ export class ClaudeAcpAgent implements Agent {
                 pending.resolve(false);
                 session.pendingMessages.delete(message.uuid as string);
                 handedOff = true;
-                // the current loop stops with end_turn,
-                // the loop of the next prompt continues running
-                return { stopReason: "end_turn", usage: sessionUsage(session) };
+                resolveIfPending({ stopReason: "end_turn", usage: sessionUsage(session) });
+                return;
               }
               if ("isReplay" in message && message.isReplay) {
                 // not pending or unrelated replay message
@@ -798,21 +839,21 @@ export class ClaudeAcpAgent implements Agent {
             // all four fields is not double-counting.
             if ((message.message as any).usage && message.parent_tool_use_id === null) {
               const messageWithUsage = message.message as unknown as SDKResultMessage;
-              lastAssistantTotalUsage =
+              session.lastAssistantTotalUsage =
                 messageWithUsage.usage.input_tokens +
                 messageWithUsage.usage.output_tokens +
                 messageWithUsage.usage.cache_read_input_tokens +
                 messageWithUsage.usage.cache_creation_input_tokens;
             }
             // Track the current top-level model for context window size lookup
-            // (exclude subagent messages to stay in sync with lastAssistantTotalUsage)
+            // (exclude subagent messages to stay in sync with session.lastAssistantTotalUsage)
             if (
               message.type === "assistant" &&
               message.parent_tool_use_id === null &&
               message.message.model &&
               message.message.model !== "<synthetic>"
             ) {
-              lastAssistantModel = message.message.model;
+              session.lastAssistantModel = message.message.model;
             }
 
             // Slash commands like /compact can generate invalid output... doesn't match
@@ -865,7 +906,7 @@ export class ClaudeAcpAgent implements Agent {
             for (const notification of toAcpNotifications(
               content,
               message.message.role,
-              params.sessionId,
+              sessionId,
               this.toolUseCache,
               this.client,
               this.logger,
@@ -890,36 +931,62 @@ export class ClaudeAcpAgent implements Agent {
             break;
         }
       }
-      throw new Error("Session did not end in result");
+      if (!promptResolved) {
+        rejectPrompt(new Error("Session did not end in result"));
+        promptResolved = true;
+      }
     } catch (error) {
-      if (error instanceof RequestError || !(error instanceof Error)) {
-        throw error;
+      if (!promptResolved) {
+        if (error instanceof RequestError || !(error instanceof Error)) {
+          rejectPrompt(error);
+          promptResolved = true;
+          return;
+        }
+        const msg = (error as Error).message;
+        if (
+          msg.includes("ProcessTransport") ||
+          msg.includes("terminated process") ||
+          msg.includes("process exited with") ||
+          msg.includes("process terminated by signal") ||
+          msg.includes("Failed to write to process stdin")
+        ) {
+          this.logger.error(`Session ${sessionId}: Claude Agent process died: ${msg}`);
+          session.settingsManager.dispose();
+          session.input.end();
+          delete this.sessions[sessionId];
+          rejectPrompt(
+            RequestError.internalError(
+              undefined,
+              "The Claude Agent process exited unexpectedly. Please start a new session.",
+            ),
+          );
+          promptResolved = true;
+          return;
+        }
+        rejectPrompt(error);
+        promptResolved = true;
+      } else if (error instanceof Error) {
+        const msg = error.message;
+        if (
+          msg.includes("ProcessTransport") ||
+          msg.includes("terminated process") ||
+          msg.includes("process exited with") ||
+          msg.includes("process terminated by signal") ||
+          msg.includes("Failed to write to process stdin")
+        ) {
+          this.logger.error(`Session ${sessionId}: Claude Agent process died: ${msg}`);
+          session.settingsManager.dispose();
+          session.input.end();
+          delete this.sessions[sessionId];
+        }
       }
-      const message = error.message;
-      if (
-        message.includes("ProcessTransport") ||
-        message.includes("terminated process") ||
-        message.includes("process exited with") ||
-        message.includes("process terminated by signal") ||
-        message.includes("Failed to write to process stdin")
-      ) {
-        this.logger.error(`Session ${params.sessionId}: Claude Agent process died: ${message}`);
-        session.settingsManager.dispose();
-        session.input.end();
-        delete this.sessions[params.sessionId];
-        throw RequestError.internalError(
-          undefined,
-          "The Claude Agent process exited unexpectedly. Please start a new session.",
-        );
-      }
-      throw error;
     } finally {
       if (!handedOff) {
         session.promptRunning = false;
         // This usually should not happen, but in case the loop finishes
         // without claude sending all message replays, we resolve the
         // next pending prompt call to ensure no prompts get stuck.
-        if (session.pendingMessages.size > 0) {
+        if (0 < session.pendingMessages.size) {
           const next = [...session.pendingMessages.entries()].sort(
             (a, b) => a[1].order - b[1].order,
           )[0];
@@ -942,6 +1009,13 @@ export class ClaudeAcpAgent implements Agent {
       pending.resolve(true);
     }
     session.pendingMessages.clear();
+    // Stop active background tasks
+    const stopPromises = [...session.activeTasks].map((taskId) =>
+      session.query.stopTask(taskId).catch(() => {
+        // Task may have already completed
+      }),
+    );
+    await Promise.all(stopPromises);
     await session.query.interrupt();
   }
 
@@ -1607,6 +1681,10 @@ export class ClaudeAcpAgent implements Agent {
       pendingMessages: new Map(),
       nextPendingOrder: 0,
       abortController,
+      activeTasks: new Set<string>(),
+      lastAssistantTotalUsage: null,
+      lastAssistantModel: null,
+      lastContextWindowSize: 200000,
     };
 
     return {

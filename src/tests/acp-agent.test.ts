@@ -1349,6 +1349,10 @@ describe("stop reason propagation", () => {
       pendingMessages: new Map(),
       nextPendingOrder: 0,
       abortController: new AbortController(),
+      activeTasks: new Set<string>(),
+      lastAssistantTotalUsage: null,
+      lastAssistantModel: null,
+      lastContextWindowSize: 200000,
     };
   }
 
@@ -1489,6 +1493,10 @@ describe("stop reason propagation", () => {
       promptRunning: false,
       pendingMessages: new Map(),
       nextPendingOrder: 0,
+      activeTasks: new Set<string>(),
+      lastAssistantTotalUsage: null,
+      lastAssistantModel: null,
+      lastContextWindowSize: 200000,
     };
 
     const response = await agent.prompt({
@@ -1563,6 +1571,10 @@ describe("session/close", () => {
       pendingMessages: new Map(),
       nextPendingOrder: 0,
       abortController: new AbortController(),
+      activeTasks: new Set<string>(),
+      lastAssistantTotalUsage: null,
+      lastAssistantModel: null,
+      lastContextWindowSize: 200000,
     };
     return agent.sessions[sessionId]!;
   }
@@ -1655,6 +1667,10 @@ describe("getOrCreateSession param change detection", () => {
       pendingMessages: new Map(),
       nextPendingOrder: 0,
       abortController: new AbortController(),
+      activeTasks: new Set<string>(),
+      lastAssistantTotalUsage: null,
+      lastAssistantModel: null,
+      lastContextWindowSize: 200000,
     };
     return agent.sessions[sessionId]!;
   }
@@ -1869,6 +1885,10 @@ describe("usage_update computation", () => {
       pendingMessages: new Map(),
       nextPendingOrder: 0,
       abortController: new AbortController(),
+      activeTasks: new Set<string>(),
+      lastAssistantTotalUsage: null,
+      lastAssistantModel: null,
+      lastContextWindowSize: 200000,
     };
   }
 
@@ -2188,5 +2208,246 @@ describe("usage_update computation", () => {
     expect(usageUpdate).toBeDefined();
     // size should be 1000000 (Opus), not 200000 (the fallback if <synthetic> overrode the model)
     expect(usageUpdate.update.size).toBe(1000000);
+  });
+});
+
+describe("prompt returns on first result (before idle)", () => {
+  function createMockAgentWithCapture() {
+    const updates: any[] = [];
+    const mockClient = {
+      sessionUpdate: async (notification: any) => {
+        updates.push(notification);
+      },
+    } as unknown as AgentSideConnection;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    return { agent, updates };
+  }
+
+  function createResultMessage(overrides?: Partial<{ subtype: string; stop_reason: string }>) {
+    return {
+      type: "result" as const,
+      subtype: overrides?.subtype ?? "success",
+      stop_reason: overrides?.stop_reason ?? "end_turn",
+      is_error: false,
+      result: "",
+      errors: [],
+      duration_ms: 0,
+      duration_api_ms: 0,
+      num_turns: 1,
+      total_cost_usd: 0,
+      usage: {
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      uuid: randomUUID(),
+      session_id: "test-session",
+    };
+  }
+
+  function injectSession(agent: ClaudeAcpAgent, messages: any[]) {
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage, done } = await iter.next();
+      if (!done && userMessage) {
+        yield {
+          type: "user",
+          message: userMessage.message,
+          parent_tool_use_id: null,
+          uuid: userMessage.uuid,
+          session_id: "test-session",
+          isReplay: true,
+        };
+      }
+      yield* messages;
+    }
+    agent.sessions["test-session"] = {
+      query: messageGenerator() as any,
+      input,
+      cancelled: false,
+      cwd: "/test",
+      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
+      modes: { currentModeId: "default", availableModes: [] },
+      models: { currentModelId: "default", availableModels: [] },
+      settingsManager: { dispose: vi.fn() } as any,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      configOptions: [],
+      promptRunning: false,
+      pendingMessages: new Map(),
+      nextPendingOrder: 0,
+      abortController: new AbortController(),
+      activeTasks: new Set<string>(),
+      lastAssistantTotalUsage: null,
+      lastAssistantModel: null,
+      lastContextWindowSize: 200000,
+    };
+  }
+
+  it("resolves prompt on first result before idle arrives", async () => {
+    const { agent } = createMockAgentWithCapture();
+
+    // Simulate: result arrives, then a gap, then idle.
+    // The prompt should resolve on result — not wait for idle.
+    let idleYielded = false;
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage, done } = await iter.next();
+      if (!done && userMessage) {
+        yield {
+          type: "user",
+          message: userMessage.message,
+          parent_tool_use_id: null,
+          uuid: userMessage.uuid,
+          session_id: "test-session",
+          isReplay: true,
+        };
+      }
+      yield createResultMessage();
+      // Simulate between-turn gap
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      idleYielded = true;
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+
+    agent.sessions["test-session"] = {
+      query: messageGenerator() as any,
+      input,
+      cancelled: false,
+      cwd: "/test",
+      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
+      modes: { currentModeId: "default", availableModes: [] },
+      models: { currentModelId: "default", availableModels: [] },
+      settingsManager: { dispose: vi.fn() } as any,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      configOptions: [],
+      promptRunning: false,
+      pendingMessages: new Map(),
+      nextPendingOrder: 0,
+      abortController: new AbortController(),
+      activeTasks: new Set<string>(),
+      lastAssistantTotalUsage: null,
+      lastAssistantModel: null,
+      lastContextWindowSize: 200000,
+    };
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+
+    // Prompt resolved BEFORE idle was yielded
+    expect(idleYielded).toBe(false);
+    expect(response.stopReason).toBe("end_turn");
+  });
+
+  it("tracks task_started and task_notification in activeTasks", async () => {
+    const { agent } = createMockAgentWithCapture();
+
+    injectSession(agent, [
+      { type: "system", subtype: "task_started", task_id: "task-1", description: "bg work", uuid: randomUUID(), session_id: "test-session" },
+      createResultMessage(),
+      { type: "system", subtype: "task_notification", task_id: "task-1", status: "completed", output_file: "", summary: "done", uuid: randomUUID(), session_id: "test-session" },
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    const session = agent.sessions["test-session"]!;
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+
+    expect(response.stopReason).toBe("end_turn");
+    // After idle, task should have been removed from activeTasks
+    // Wait a tick for the background loop to process remaining events
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(session.activeTasks.size).toBe(0);
+  });
+
+  it("cancel stops active background tasks via stopTask", async () => {
+    const { agent } = createMockAgentWithCapture();
+    const stopTaskFn = vi.fn().mockResolvedValue(undefined);
+
+    const input = new Pushable<any>();
+    // Generator that never yields idle — simulates hanging session
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage, done } = await iter.next();
+      if (!done && userMessage) {
+        yield {
+          type: "user",
+          message: userMessage.message,
+          parent_tool_use_id: null,
+          uuid: userMessage.uuid,
+          session_id: "test-session",
+          isReplay: true,
+        };
+      }
+      yield { type: "system", subtype: "task_started", task_id: "task-42", description: "bg", uuid: randomUUID(), session_id: "test-session" };
+      yield createResultMessage();
+      // Hold the generator open so we can cancel
+      await new Promise(() => {});
+    }
+
+    const gen = messageGenerator();
+    agent.sessions["test-session"] = {
+      query: Object.assign(gen, {
+        interrupt: vi.fn(),
+        stopTask: stopTaskFn,
+      }) as any,
+      input,
+      cancelled: false,
+      cwd: "/test",
+      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
+      modes: { currentModeId: "default", availableModes: [] },
+      models: { currentModelId: "default", availableModels: [] },
+      settingsManager: { dispose: vi.fn() } as any,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      configOptions: [],
+      promptRunning: false,
+      pendingMessages: new Map(),
+      nextPendingOrder: 0,
+      abortController: new AbortController(),
+      activeTasks: new Set<string>(),
+      lastAssistantTotalUsage: null,
+      lastAssistantModel: null,
+      lastContextWindowSize: 200000,
+    };
+
+    // Start prompt (it will resolve on result, loop continues in background)
+    const promptPromise = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+
+    const response = await promptPromise;
+    expect(response.stopReason).toBe("end_turn");
+
+    // task-42 should be in activeTasks now
+    expect(agent.sessions["test-session"]!.activeTasks.has("task-42")).toBe(true);
+
+    // Cancel should call stopTask for active tasks
+    await agent.cancel({ sessionId: "test-session" });
+    expect(stopTaskFn).toHaveBeenCalledWith("task-42");
   });
 });

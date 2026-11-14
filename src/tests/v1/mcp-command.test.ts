@@ -810,14 +810,14 @@ describe("/mcp and MCP OAuth", () => {
   // here. This fork starts it and sends the authorization URL to the desktop
   // browser, because a client without URL elicitation otherwise gets no way
   // to authorize by any route. See src/open-url.ts.
-  it("starts the MCP OAuth flow without URL elicitation, for the browser", async () => {
+  it("starts the MCP OAuth flow without URL elicitation", async () => {
     const mcpAuthenticate = authenticated();
     const { prompt } = setup({ query: { mcpAuthenticate }, acpServers: ["linear"] });
 
     await prompt("/mcp reconnect linear");
-    await new Promise((resolve) => setTimeout(resolve, 0));
 
-    await vi.waitFor(() => expect(mcpAuthenticate).toHaveBeenCalledWith("linear"));
+    await vi.waitFor(() => expect(mcpAuthenticate).toHaveBeenCalledOnce());
+    expect(mcpAuthenticate).toHaveBeenCalledWith("linear");
   });
 
   it("does not start the MCP OAuth flow when the result fell back to the CLI text", async () => {

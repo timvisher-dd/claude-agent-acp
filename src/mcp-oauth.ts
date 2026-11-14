@@ -4,6 +4,7 @@
  * both start it once a session's setup response is sent.
  */
 import { randomUUID } from "node:crypto";
+import { openUrl } from "./open-url.js";
 import type {
   CompleteElicitationNotification,
   CreateElicitationRequest,
@@ -41,7 +42,8 @@ export function supportsMcpOAuth(query: Query): query is McpOAuthQuery {
 
 /** What an OAuth run needs of the client connection. */
 export type McpOAuthClient = {
-  /** Whether the client advertised URL elicitation. Without it, OAuth does not start. */
+  /** Whether the client advertised URL elicitation. Without it the authorization
+   *  URL goes to the desktop browser instead. */
   readonly urlElicitation: boolean;
   createElicitation(
     params: CreateElicitationRequest,
@@ -72,7 +74,7 @@ export function startMcpServerAuthentication(
   session: McpOAuthSession,
   requestedServers: Set<string>,
 ): void {
-  if (!client.urlElicitation || requestedServers.size === 0) return;
+  if (requestedServers.size === 0) return;
   const query = session.currentQuery();
   if (!query || mcpAuthentications.has(session.key)) return;
 
@@ -139,6 +141,27 @@ async function authenticateMcpServer(
 
   try {
     const completed = waitForMcpAuthentication(session, query, serverName, flowAbort.signal);
+
+    // A client without URL elicitation has no way to show the URL, so the
+    // flow would otherwise never start for it. Hand the URL to the desktop
+    // browser and wait for Claude Code's callback listener to report the
+    // result. This keeps elicitation's safety property: the credential
+    // never transits ACP and never enters model context. With no browser to
+    // spawn -- headless hosts, containers, CI -- log the URL so it can be
+    // completed by hand.
+    if (!client.urlElicitation) {
+      try {
+        await openUrl(login.authUrl);
+      } catch (error) {
+        client.logger.error(
+          `Could not open a browser for MCP server ${serverName}; ` +
+            `authorize at ${login.authUrl} (${error})`,
+        );
+      }
+      await completed;
+      return;
+    }
+
     const elicitation = client.createElicitation(
       {
         mode: "url",

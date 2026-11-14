@@ -32,11 +32,14 @@ let setModelImpl: ((model: string) => Promise<void>) | undefined;
 let interruptImpl: (() => Promise<undefined>) | undefined;
 let closeSpy: ReturnType<typeof vi.fn<() => void>>;
 let mcpServerStatusResult: () => Promise<Array<{ name: string; status: string }>>;
+import { openUrl } from "../../open-url.js";
+
 let mcpAuthenticateImpl: (serverName: string) => Promise<{
   authUrl?: string;
   requiresUserAction: boolean;
   callbackExpected: boolean;
 }>;
+vi.mock("../../open-url.js", () => ({ openUrl: vi.fn(async () => {}) }));
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
   const actual = await vi.importActual<typeof import("@anthropic-ai/claude-agent-sdk")>(
     "@anthropic-ai/claude-agent-sdk",
@@ -1704,6 +1707,37 @@ describe("createSession options merging", () => {
 
       expect(capturedOptions!.disallowedTools).toContain("AskUserQuestion");
       expect(typeof capturedOptions!.onElicitation).toBe("function");
+    });
+
+    it("opens the authorization URL in a browser when the client cannot present it", async () => {
+      let statusCall = 0;
+      mcpServerStatusResult = async () =>
+        statusCall++ === 0
+          ? [{ name: "linear", status: "needs-auth" }]
+          : [{ name: "linear", status: "connected" }];
+      const authenticate = vi.fn(async () => ({
+        authUrl: "https://example.com/oauth/authorize",
+        requiresUserAction: true,
+        callbackExpected: true,
+      }));
+      mcpAuthenticateImpl = authenticate;
+      const createElicitation = vi.fn(async () => ({ action: "accept" as const }));
+      Object.assign((agent as unknown as { client: object }).client, { createElicitation });
+
+      // No elicitation capability at all: upstream stops before looking at
+      // any server, so without the fallback nothing reaches the user.
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [
+          { name: "linear", type: "http", url: "https://mcp.linear.app/mcp", headers: [] },
+        ],
+      });
+
+      await vi.waitFor(() =>
+        expect(openUrl).toHaveBeenCalledWith("https://example.com/oauth/authorize"),
+      );
+      expect(createElicitation).not.toHaveBeenCalled();
     });
 
     it("starts MCP OAuth as an ACP URL elicitation and completes it after reconnect", async () => {
